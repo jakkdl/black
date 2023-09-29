@@ -58,6 +58,7 @@ class Line:
     inside_brackets: bool = False
     should_split_rhs: bool = False
     magic_trailing_comma: Optional[Leaf] = None
+    ignore_is_def: bool = False
 
     def append(
         self, leaf: Leaf, preformatted: bool = False, track_bracket: bool = False

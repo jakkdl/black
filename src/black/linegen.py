@@ -573,7 +573,7 @@ def transform_line(
             transformers = [string_merge, string_paren_strip]
         else:
             transformers = []
-    elif line.is_def:
+    elif line.is_def and not line.ignore_is_def:
         transformers = [left_hand_split]
     else:
 
@@ -658,20 +658,48 @@ class _BracketSplitComponent(Enum):
     tail = auto()
 
 
-def left_hand_split(
-    line: Line, _features: Collection[Feature], mode: Mode
-) -> Iterator[Line]:
-    """Split line into many lines, starting with the first matching bracket pair.
+def build_line_from_leaves(original: Line, leaves: List[Leaf]) -> Line:
+    result = Line(mode=original.mode, depth=original.depth)
+    leaves_to_track: Set[LeafID] = set()
+    leaves_to_track = get_leaves_inside_matching_brackets(leaves)
+    # Populate the line
+    for leaf in leaves:
+        result.append(
+            leaf,
+            preformatted=True,
+            track_bracket=id(leaf) in leaves_to_track,
+        )
+        for comment_after in original.comments_after(leaf):
+            result.append(comment_after, preformatted=True)
+    return result
 
-    Note: this usually looks weird, only use this for function definitions.
-    Prefer RHS otherwise.  This is why this function is not symmetrical with
-    :func:`right_hand_split` which also handles optional parentheses.
+
+def left_hand_split(
+    line: Line, features: Collection[Feature], mode: Mode
+) -> Iterator[Line]:
     """
+    TODO
+    """
+    # Before return type annotations existed, we could assume that we should
+    # always split on head, body and tail - but that is no longer the case.
+
+    # if either/both of body/tail contain magic commas, or they on their own are too
+    # long, we split them
+
+    # length .... TODO write documentation
+
+    def reprocess_as_nondef(line: Line) -> Iterator[Line]:
+        line.should_split_rhs = True
+        line.ignore_is_def = True
+        yield from transform_line(line, features=features, mode=mode)
+
     tail_leaves: List[Leaf] = []
     body_leaves: List[Leaf] = []
     head_leaves: List[Leaf] = []
     current_leaves = head_leaves
     matching_bracket: Optional[Leaf] = None
+    has_split = False
+
     for leaf in line.leaves:
         if (
             current_leaves is body_leaves
@@ -681,7 +709,7 @@ def left_hand_split(
         ):
             ensure_visible(leaf)
             ensure_visible(matching_bracket)
-            current_leaves = tail_leaves if body_leaves else head_leaves
+            current_leaves = tail_leaves
         current_leaves.append(leaf)
         if current_leaves is head_leaves:
             if leaf.type in OPENING_BRACKETS:
@@ -690,15 +718,96 @@ def left_hand_split(
     if not matching_bracket:
         raise CannotSplit("No brackets found")
 
-    head = bracket_split_build_line(
-        head_leaves, line, matching_bracket, component=_BracketSplitComponent.head
+    # ugly, should modify/split bracket_split_build_line
+    head = build_line_from_leaves(line, head_leaves + body_leaves)
+    body = Line(mode=line.mode, depth=line.depth)
+    tail = build_line_from_leaves(line, tail_leaves)
+
+    # -3 because of " ->" (?)
+    head_short = is_line_short_enough(
+        head, mode=replace(mode, line_length=mode.line_length - 3)
     )
-    body = bracket_split_build_line(
-        body_leaves, line, matching_bracket, component=_BracketSplitComponent.body
+    # -1 because of closing parantheses on paramlist (?)
+    tail_short = is_line_short_enough(
+        tail, mode=replace(mode, line_length=mode.line_length - 1)
     )
-    tail = bracket_split_build_line(
-        tail_leaves, line, matching_bracket, component=_BracketSplitComponent.tail
-    )
+
+    if (
+        head.magic_trailing_comma
+        or not head_short
+        or (body_leaves and body_leaves[-1].type == token.COMMA)
+    ):
+        head = bracket_split_build_line(
+            head_leaves, line, matching_bracket, component=_BracketSplitComponent.head
+        )
+        # par list
+        body = bracket_split_build_line(
+            body_leaves, line, matching_bracket, component=_BracketSplitComponent.body
+        )
+        has_split = True
+
+    if tail.magic_trailing_comma or not tail_short:
+        # TODO: figure out shit
+        # reprocess this line as a non-funcdef line that needs splitting with rhs
+        lines = list(reprocess_as_nondef(line))
+        if len(lines) > 1:
+            yield from lines
+            return
+        elif not has_split:
+            # we failed to split the tail, so let's split the head instead
+            head = bracket_split_build_line(
+                head_leaves,
+                line,
+                matching_bracket,
+                component=_BracketSplitComponent.head,
+            )
+            # par list
+            body = bracket_split_build_line(
+                body_leaves,
+                line,
+                matching_bracket,
+                component=_BracketSplitComponent.body,
+            )
+        has_split = True
+
+    # we're splitting because the line is long, not because of any magic_trailing_commas
+    if not has_split:
+        # check which is longer
+        if len(str(head)) > len(str(tail)):
+            head = bracket_split_build_line(
+                head_leaves,
+                line,
+                matching_bracket,
+                component=_BracketSplitComponent.head,
+            )
+            # par list
+            body = bracket_split_build_line(
+                body_leaves,
+                line,
+                matching_bracket,
+                component=_BracketSplitComponent.body,
+            )
+        else:
+            lines = list(reprocess_as_nondef(line))
+            if len(lines) > 1:
+                yield from lines
+                return
+            else:
+                # we failed to split the tail, so let's split the head instead
+                head = bracket_split_build_line(
+                    head_leaves,
+                    line,
+                    matching_bracket,
+                    component=_BracketSplitComponent.head,
+                )
+                # par list
+                body = bracket_split_build_line(
+                    body_leaves,
+                    line,
+                    matching_bracket,
+                    component=_BracketSplitComponent.body,
+                )
+
     bracket_split_succeeded_or_raise(head, body, tail)
     for result in (head, body, tail):
         if result:
@@ -939,7 +1048,7 @@ def bracket_split_build_line(
                 # be defined directly in the parent node, the parent of the parent ...
                 # and so on depending on how complex the return annotation is.
                 # This isn't perfect and there's some false negatives but they are in
-                # contexts were a comma is actually fine.
+                # contexts where a comma is actually fine.
                 and not any(
                     node.prev_sibling.type == RARROW
                     for node in (
